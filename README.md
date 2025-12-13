@@ -100,7 +100,6 @@ In real deployments, this architecture helped predict call demand across a 12-mo
 ## Author
 
 **Xichun (Harrison) Han**  
-AI & Data Strategy Manager @ Viking Cruises  
 [LinkedIn](https://www.linkedin.com/in/xichun-han)
 
 ---
