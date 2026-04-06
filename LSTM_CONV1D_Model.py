@@ -18,7 +18,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.layers import (LSTM, Conv1D, Dense, Activation,
-                                     Dropout, Input, Flatten) # Added Flatten for simple model
+                                     Dropout, Input)
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.optimizers import Adam, Nadam
 from tensorflow.keras.regularizers import l2
@@ -178,19 +178,6 @@ def create_sequences_from_data(dataset_values, n_past, n_features_expected, targ
     return np.array(data_x), np.array(data_y) # Caller will astype to float32
 
 # --- Model Building Functions ---
-def build_keras_model_ULTRA_SIMPLE(input_shape_tuple_param):
-    """Builds an extremely simple Keras model for debugging purposes."""
-    print(f"[DEBUG SimpleModel] Building ULTRA_SIMPLE model with input shape: {input_shape_tuple_param}")
-    model = Sequential(name="UltraSimpleModel_Debug")
-    model.add(Input(shape=input_shape_tuple_param))
-    model.add(Flatten()) 
-    model.add(Dense(1, activation="linear")) 
-    
-    optimizer = Adam(learning_rate=0.001) 
-    model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
-    print("[DEBUG SimpleModel] ULTRA_SIMPLE model compiled.")
-    model.summary(print_fn=lambda x: print(f"[DEBUG SimpleModel] {x}")) 
-    return model
 
 def build_keras_model(input_shape_tuple, optimizer_name='adam', learning_rate=0.001, l2_coeff=0.01):
     """Builds the Keras Conv1D + LSTM model."""
@@ -214,7 +201,7 @@ def build_keras_model(input_shape_tuple, optimizer_name='adam', learning_rate=0.
     model.add(Dropout(0.3, name="Dropout_3"))
     model.add(Dense(32, activation="relu", kernel_initializer="uniform", name="Dense_1"))
     model.add(Dropout(0.2, name="Dropout_4"))
-    model.add(Dense(1, activation="relu", kernel_initializer="uniform", name="Output_Dense"))
+    model.add(Dense(1, activation="linear", kernel_initializer="uniform", name="Output_Dense"))
 
     model.compile(loss='mse', optimizer=opt, metrics=['mae', 'mse'])
     return model
@@ -279,58 +266,9 @@ def run_forecast_pipeline():
     else:
         print("testX_cv or y_test_cv is empty.")
 
-    current_model_input_shape = (N_PAST_STEPS, N_FEATURES_DYNAMIC) 
-    print(f"[DEBUG] current_model_input_shape in run_forecast_pipeline defined as: {current_model_input_shape}") 
-    
-    # --- Temporary Debug Block for direct model.fit with ULTRA_SIMPLE model ---
-    print("\n[DEBUG] Attempting direct Keras model.fit() WITH ULTRA_SIMPLE_MODEL...")
-    direct_fit_successful = False
-    if X_train_cv.size > 0:
-        try:
-            debug_model_instance = build_keras_model_ULTRA_SIMPLE( 
-                input_shape_tuple_param=current_model_input_shape
-            )
-            
-            print("[DEBUG] Starting direct model.fit() for 3 epochs with ULTRA_SIMPLE model...")
-            history_debug = debug_model_instance.fit( 
-                X_train_cv,
-                y_train_cv,
-                epochs=3,       
-                batch_size=32,  
-                verbose=1       
-            )
-            print("[DEBUG] Direct Keras model.fit() with ULTRA_SIMPLE model completed 3 epochs.")
-            print(f"[DEBUG] History from direct fit: {history_debug.history}")
-            direct_fit_successful = True 
-        except Exception as e_debug_fit:
-            print(f"[DEBUG] ERROR during direct Keras model.fit() with ULTRA_SIMPLE model: {e_debug_fit}")
-            traceback.print_exc()
-            direct_fit_successful = False
-    else:
-        print("[DEBUG] Skipping direct model fit as X_train_cv is empty.")
-    print("[DEBUG] Finished direct Keras model.fit() attempt with ULTRA_SIMPLE model.\n")
-    
-    # --- If direct fit was successful, then proceed to GridSearchCV with the original complex model ---
-    # --- Otherwise, we might skip GridSearchCV or try it with the simple model for further diagnosis ---
-    if not direct_fit_successful:
-        print("[CRITICAL DEBUG] Direct fit with ULTRA_SIMPLE model failed or was skipped. ")
-        print("Skipping GridSearchCV with the complex model as a basic fit is not working.")
-        print("Please check RAM usage during the direct fit and TensorFlow/environment integrity.")
-        # Optionally, you could try GridSearchCV with the ULTRA_SIMPLE model here as a further test:
-        # print("[DEBUG] Trying GridSearchCV with ULTRA_SIMPLE model...")
-        # simple_estimator = KerasRegressor(model=build_keras_model_ULTRA_SIMPLE, model__input_shape_tuple_param=current_model_input_shape, verbose=1)
-        # simple_grid_params = {'batch_size': [32], 'epochs': [2]} # minimal params
-        # tscv_simple = TimeSeriesSplit(n_splits=2)
-        # grid_simple = GridSearchCV(estimator=simple_estimator, param_grid=simple_grid_params, cv=tscv_simple, verbose=2, n_jobs=1, error_score='raise')
-        # try:
-        #     grid_simple.fit(X_train_cv, y_train_cv)
-        #     print("[DEBUG] GridSearchCV with ULTRA_SIMPLE model completed.")
-        # except Exception as e_grid_simple:
-        #     print(f"[DEBUG] Error with GridSearchCV and ULTRA_SIMPLE model: {e_grid_simple}")
-        #     traceback.print_exc()
-        # return # End execution here if direct fit failed
-    
-    # --- Original GridSearchCV Phase (Now called Phase 3) ---
+    current_model_input_shape = (N_PAST_STEPS, N_FEATURES_DYNAMIC)
+
+    # --- Phase 3: GridSearchCV ---
     print("\n[PHASE 3] Hyperparameter Tuning with GridSearchCV (Using original complex model)...")
     try:
         with open(SCALER_CV_PKL, 'wb') as f: # Save scaler before potential crash in GridSearchCV
@@ -358,7 +296,7 @@ def run_forecast_pipeline():
     )
 
     early_stopping_callback_cv = EarlyStopping(
-        monitor='loss', patience=EARLY_STOPPING_PATIENCE, verbose=1, restore_best_weights=True
+        monitor='val_loss', patience=EARLY_STOPPING_PATIENCE, verbose=1, restore_best_weights=True
     )
 
     best_cv_model = None
@@ -366,7 +304,7 @@ def run_forecast_pipeline():
 
     print("\nStarting GridSearchCV fit (with complex model)...")
     try:
-        grid_search_obj.fit(X_train_cv, y_train_cv, callbacks=[early_stopping_callback_cv])
+        grid_search_obj.fit(X_train_cv, y_train_cv, callbacks=[early_stopping_callback_cv], validation_split=0.1)
         print("\nGridSearchCV completed!")
         print(f"Best parameters found: {grid_search_obj.best_params_}")
         print(f"Best CV score (neg_mean_squared_error): {grid_search_obj.best_score_:.4f}")
@@ -445,13 +383,14 @@ def run_forecast_pipeline():
             )
             # ... (rest of final model training) ...
             early_stopping_final_train = EarlyStopping(
-                monitor='loss', patience=EARLY_STOPPING_PATIENCE, verbose=1, restore_best_weights=True
+                monitor='val_loss', patience=EARLY_STOPPING_PATIENCE, verbose=1, restore_best_weights=True
             )
             final_model.fit(
                 X_all_hist, y_all_hist,
                 epochs=best_cv_params['epochs'],
                 batch_size=best_cv_params['batch_size'],
                 callbacks=[early_stopping_final_train],
+                validation_split=0.1,
                 verbose=1
             )
             print("Final model training complete.")

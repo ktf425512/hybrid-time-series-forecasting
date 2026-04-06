@@ -10,8 +10,8 @@ np.random.seed(42)
 # Path to your base historical dummy data.
 # This is used to determine the start date for future simulation.
 # If not found, a fallback (current date) is used.
-HISTORICAL_DUMMY_DATA_PATH = 'dummy_direct_data.csv'
-OUTPUT_MOCK_MONTHLY_SUM_PATH = 'mock_future_Month_Sum.csv' # Output file
+HISTORICAL_DUMMY_DATA_PATH = 'dummy_data.csv'
+OUTPUT_MOCK_MONTHLY_SUM_PATH = 'future_Month_Sum.csv' # Output file
 NUM_FUTURE_MONTHS = 12 # Simulate for 12 future months
 
 # Parameters for generating daily 'Total_Presented'
