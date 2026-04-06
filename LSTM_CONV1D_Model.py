@@ -4,6 +4,8 @@ import traceback
 import pickle
 
 # --- Third-party Library Imports ---
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for saving plots without display
 import holidays
 import matplotlib.dates as mdates # Not explicitly used in the direct flow, but kept from notebook
 import numpy as np
@@ -59,10 +61,10 @@ TRAIN_SPLIT_RATIO_CV = 0.95 # For GridSearchCV and its internal test split
 CV_N_SPLITS = 3
 GRID_SEARCH_PARAMS = {
     'batch_size': [16,32],
-    'epochs': [30, 50], 
+    'epochs': [30, 50],
     'optimizer': ['adam', 'nadam'],
     'optimizer__learning_rate': [0.0005, 0.001],
-    'model__l2_coeff': [0.01, 0.001] 
+    'model__l2_coeff': [0.01, 0.001]
 }
 EARLY_STOPPING_PATIENCE = 10
 FIXED_L2_COEFF = 0.01 # Used if not tuning l2_coeff via GridSearchCV
@@ -343,7 +345,10 @@ def run_forecast_pipeline():
             plt.plot(plot_dates_cv_test, preds_original_cv, label='Predicted (Original Scale)', alpha=0.7)
             plt.title('CV Test Set: Actual vs. Predicted (Original Scale)')
             plt.xlabel('Date'); plt.ylabel(TARGET_COLUMN_NAME); plt.legend()
-            plt.xticks(rotation=45); plt.tight_layout(); plt.show()
+            plt.xticks(rotation=45); plt.tight_layout()
+            plt.savefig(os.path.join(BASE_DIR, 'cv_test_actual_vs_predicted.png'), dpi=150)
+            plt.close()
+            print("Plot saved to cv_test_actual_vs_predicted.png")
 
     except Exception as e:
         print(f"An error occurred during GridSearchCV or evaluation: {e}")
@@ -454,7 +459,7 @@ def run_forecast_pipeline():
         try:
             df_future_monthly_sums = pd.read_csv(FUTURE_MONTH_SUM_FILE, parse_dates=['date'])
             df_future_monthly_sums.rename(columns={'date': 'month_start_key', 'monthly_sum': 'monthly_sum_future_val'}, inplace=True)
-            df_future_monthly_sums['month_start_key'] = pd.to_datetime(df_future_monthly_sums['month_start_key']).dt.to_period('M').to_timestamp()
+            df_future_monthly_sums['month_start_key'] = pd.to_datetime(df_future_monthly_sums['month_start_key']).dt.to_period('M').dt.to_timestamp()
 
             df_future_base['month_start_key'] = df_future_base.index.to_period('M').to_timestamp()
             df_future_base = pd.merge(df_future_base.reset_index(), 
@@ -523,7 +528,10 @@ def run_forecast_pipeline():
         plt.plot(df_historical.index[-60:], df_historical[TARGET_COLUMN_NAME].iloc[-60:], label='Historical Actual')
         plt.plot(df_forecast_results['date'], df_forecast_results[f'{TARGET_COLUMN_NAME}_forecast'], label='Future Forecast')
         plt.title('Forecast vs Historical'); plt.xlabel('Date'); plt.ylabel(TARGET_COLUMN_NAME); plt.legend()
-        plt.xticks(rotation=45); plt.tight_layout(); plt.show()
+        plt.xticks(rotation=45); plt.tight_layout()
+        plt.savefig(os.path.join(BASE_DIR, 'forecast_vs_historical.png'), dpi=150)
+        plt.close()
+        print("Plot saved to forecast_vs_historical.png")
     else:
         print("\nSkipping Future Prediction phase as no model is available.")
 
