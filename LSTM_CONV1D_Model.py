@@ -1,200 +1,231 @@
-# --- Standard Library Imports ---
+"""Conv1D + LSTM daily call-volume forecasting pipeline.
+
+Train a daily call-volume model with a manual TimeSeriesSplit CV over a
+hyperparameter grid and generate a 12-month forward forecast via iterative
+1-step-ahead prediction.
+
+The project framing is *disaggregation*: at inference we have an external
+monthly-total forecast (``future_Month_Sum.csv``) and the model learns the
+daily breakdown within it. See ``inject_monthly_sum_noise`` for the reason
+we perturb the training-time monthly_sum signal.
+"""
 import os
-import traceback
 import pickle
 
-# --- Third-party Library Imports ---
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for saving plots without display
+matplotlib.use('Agg')  # write PNGs, never display
 import holidays
-import matplotlib.dates as mdates # Not explicitly used in the direct flow, but kept from notebook
 import numpy as np
 import pandas as pd
-# import seaborn as sns # Not critically used in the core notebook logic for this script
 import tensorflow as tf
-
 from matplotlib import pyplot as plt
-from scikeras.wrappers import KerasRegressor
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import ParameterGrid, TimeSeriesSplit
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.layers import (LSTM, Conv1D, Dense, Activation,
-                                     Dropout, Input)
+from tensorflow.keras.layers import LSTM, Conv1D, Dense, Dropout, Input
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.optimizers import Adam, Nadam
 from tensorflow.keras.regularizers import l2
 
-# --- Configuration Parameters ---
-# Determine the base directory of the script
+# --- Paths ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# File Paths (adjust if your files are elsewhere relative to the script)
 HISTORICAL_DATA_FILE = os.path.join(BASE_DIR, 'dummy_data.csv')
 FUTURE_ROLLCAP_FILE = os.path.join(BASE_DIR, 'mock_future_RollCap.csv')
 FUTURE_MONTH_SUM_FILE = os.path.join(BASE_DIR, 'future_Month_Sum.csv')
 
-# Output files
 SCALER_CV_PKL = os.path.join(BASE_DIR, 'scaler_cv_notebook_converted.pkl')
 SCALER_FINAL_PKL = os.path.join(BASE_DIR, 'scaler_final_notebook_converted.pkl')
 MODEL_FINAL_KERAS = os.path.join(BASE_DIR, 'model_final_notebook_converted.keras')
+CV_TEST_PLOT = os.path.join(BASE_DIR, 'cv_test_actual_vs_predicted.png')
+FORECAST_PLOT = os.path.join(BASE_DIR, 'forecast_vs_historical.png')
 
-# Holiday Settings
-HOLIDAY_YEARS = [2021, 2022, 2023, 2024, 2025, 2026, 2027] # Extend as needed
+# --- Holiday settings ---
+HOLIDAY_YEARS = list(range(2021, 2028))
 US_HOLIDAYS_SUBSET = [
     "New Year's Day", "New Year's Day (observed)", "Memorial Day",
-    "Independence Day", "Labor Day", "Thanksgiving", "Christmas Day"
+    "Independence Day", "Labor Day", "Thanksgiving", "Christmas Day",
 ]
 HOLIDAY_A_NAMES = ["Thanksgiving", "Christmas Day"]
 
-# Feature Engineering & Model Structure
-N_PAST_STEPS = 7  # Look-back window size
-# N_FEATURES_DYNAMIC will be determined dynamically after all features are created.
-TARGET_COLUMN_NAME = 'Total_Presented'
-COLUMNS_TO_SCALE = ['Total_Presented', 'RollCap', 'monthly_sum']
-# ALL_FEATURES_ORDERED_LIST will also be determined dynamically.
+# --- Features (single source of truth; scaled subset derived by name) ---
+FEATURE_ORDER = (
+    'Total_Presented',   # target (index 0)
+    'RollCap',
+    'Holiday_A',
+    'Holiday_B',
+    'weekday',
+    'week_number',
+    'month',
+    'monthly_sum',
+)
+_SCALED_FEATURES = {'Total_Presented', 'RollCap', 'monthly_sum'}
+COLUMNS_TO_SCALE = [c for c in FEATURE_ORDER if c in _SCALED_FEATURES]
+TARGET_COLUMN_NAME = FEATURE_ORDER[0]
+N_FEATURES = len(FEATURE_ORDER)
 
-# Training Settings
-TRAIN_SPLIT_RATIO_CV = 0.95 # For GridSearchCV and its internal test split
-
-# GridSearchCV Settings
+# --- Windowing / training ---
+N_PAST_STEPS = 7
+TRAIN_SPLIT_RATIO_CV = 0.95
 CV_N_SPLITS = 3
+# Hyperparameter grid — kept to a single combo on this stack because repeated
+# Keras model.fit() calls in the same process trigger a native-layer crash
+# on Windows (Python exits 127/139 after ~2-3 fits, no Python traceback, due
+# to TF graph accumulation that clear_session doesn't fully release). The
+# manual CV loop still runs CV_N_SPLITS folds of this one combo as a TSS
+# sanity check. To explore more hyperparameters, run the pipeline repeatedly
+# with different values (each run is a fresh process) or port the search to
+# a subprocess-per-fit worker.
 GRID_SEARCH_PARAMS = {
-    'batch_size': [16,32],
-    'epochs': [30, 50],
-    'optimizer': ['adam', 'nadam'],
-    'optimizer__learning_rate': [0.0005, 0.001],
-    'model__l2_coeff': [0.01, 0.001]
+    'batch_size': [16],
+    'epochs': [30],
+    'optimizer': ['adam'],
+    'learning_rate': [0.001],
+    'l2_coeff': [0.01],
 }
 EARLY_STOPPING_PATIENCE = 10
-FIXED_L2_COEFF = 0.01 # Used if not tuning l2_coeff via GridSearchCV
+FIXED_L2_COEFF = 0.01
 
-# --- Helper Functions ---
+# Disaggregation framing: at inference, monthly_sum comes from an external
+# forecast that typically drifts 5-10%. Training on the exact sum-of-target
+# (noise-free) teaches the model to over-rely on a signal it won't have in
+# production. We inject per-month multiplicative jitter to close the gap.
+MONTHLY_SUM_NOISE_STD = 0.05
+MONTHLY_SUM_NOISE_SEED = 42
+
+PIPELINE_SEED = 42
+
 
 def load_holidays_data(years, holiday_a_names_list, us_holidays_subset_list):
-    # Loads and preprocesses holiday data, creating Holiday_A and Holiday_B features.
-    h_list = []
-    for item in holidays.UnitedStates(years=years).items():
-        h_list.append(item)
-    
-    df_h = pd.DataFrame(h_list, columns=['date', 'holiday_name'])
+    """Build per-date Holiday_A/Holiday_B flags from the `holidays` package."""
+    items = list(holidays.UnitedStates(years=years).items())
+    df_h = pd.DataFrame(items, columns=['date', 'holiday_name'])
     df_h['date'] = pd.to_datetime(df_h['date'])
     df_h.drop_duplicates(subset=['date'], keep='first', inplace=True)
-    
-    df_h['Holiday_A'] = df_h['holiday_name'].apply(lambda x: 1 if x in holiday_a_names_list else 0)
-    df_h['Holiday_B'] = df_h['holiday_name'].apply(
-        lambda x: 1 if (x in us_holidays_subset_list and x not in holiday_a_names_list) else 0
-    )
+
+    df_h['Holiday_A'] = df_h['holiday_name'].isin(holiday_a_names_list).astype(int)
+    df_h['Holiday_B'] = (
+        df_h['holiday_name'].isin(us_holidays_subset_list)
+        & ~df_h['holiday_name'].isin(holiday_a_names_list)
+    ).astype(int)
     return df_h[['date', 'Holiday_A', 'Holiday_B']]
 
+
 def engineer_features_historical(filepath, df_holidays):
-    # Loads historical data and engineers all features including monthly_sum.
+    """Load historical CSV and join calendar + monthly_sum features."""
     df = pd.read_csv(filepath, parse_dates=['date'])
-    
+
     df = pd.merge(df, df_holidays, on='date', how='left')
     df['Holiday_A'] = df['Holiday_A'].fillna(0).astype(int)
     df['Holiday_B'] = df['Holiday_B'].fillna(0).astype(int)
-    
-    df['date_dt'] = pd.to_datetime(df['date']) 
-    
-    df['month_start_key'] = df['date_dt'].dt.to_period('M').apply(lambda p: p.to_timestamp())
 
+    df['date_dt'] = pd.to_datetime(df['date'])
+    df['month_start_key'] = df['date_dt'].dt.to_period('M').dt.to_timestamp()
     df['weekday'] = df['date_dt'].dt.dayofweek
     df['week_number'] = df['date_dt'].dt.isocalendar().week.astype(int)
     df['month'] = df['date_dt'].dt.month
-    
-    df_temp_for_monthly_sum = df.set_index('date_dt') 
-    monthly_sum_series = df_temp_for_monthly_sum[TARGET_COLUMN_NAME].resample('MS').sum()
-    monthly_sum_series.name = 'monthly_sum_val' 
-    
+
+    monthly_sum_series = (
+        df.set_index('date_dt')[TARGET_COLUMN_NAME]
+        .resample('MS').sum()
+        .rename('monthly_sum_val')
+    )
     df = pd.merge(df, monthly_sum_series, left_on='month_start_key', right_index=True, how='left')
-    df.rename(columns={'monthly_sum_val': 'monthly_sum'}, inplace=True)
-    df['monthly_sum'] = df['monthly_sum'].ffill().bfill().fillna(0) 
-    
-    df = df.set_index('date_dt') 
-    
-    feature_order = [
-        TARGET_COLUMN_NAME, 'RollCap', 'Holiday_A', 'Holiday_B',
-        'weekday', 'week_number', 'month', 'monthly_sum'
-    ]
-    for col in feature_order:
+    df = df.rename(columns={'monthly_sum_val': 'monthly_sum'})
+    df['monthly_sum'] = df['monthly_sum'].ffill().bfill().fillna(0)
+
+    df = df.set_index('date_dt')
+    for col in FEATURE_ORDER:
         if col not in df.columns:
-            df[col] = 0 
-    df = df[feature_order]
-    
-    cols_to_drop = ['date', 'month_start_key'] 
-    df.drop(columns=[col for col in cols_to_drop if col in df.columns], inplace=True, errors='ignore')
+            df[col] = 0
+    return df[list(FEATURE_ORDER)]
 
-    return df, feature_order
 
-def scale_data_and_create_sequences(df_full, train_ratio, n_past, cols_to_scale_list, 
-                                    ordered_features_list, target_col_name):
-    # Splits, scales, and creates sequences for training and testing.
-    split_idx = int(len(df_full) * train_ratio)
-    df_train = df_full.iloc[:split_idx]
-    df_test = df_full.iloc[split_idx:]
-    
-    print(f"Training set size: {len(df_train)}, Testing set size: {len(df_test)}")
-    
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    
-    df_train_scaled = df_train.copy()
-    df_test_scaled = df_test.copy() 
-    
-    df_train_scaled[cols_to_scale_list] = scaler.fit_transform(df_train[cols_to_scale_list])
-    if not df_test.empty:
-        df_test_scaled[cols_to_scale_list] = scaler.transform(df_test[cols_to_scale_list])
-    else:
-        print("Warning: Test set is empty, skipping scaling for it.")
+def inject_monthly_sum_noise(df, noise_std=MONTHLY_SUM_NOISE_STD, seed=MONTHLY_SUM_NOISE_SEED):
+    """Multiply each calendar month's monthly_sum by one shared jitter factor.
 
-    df_train_scaled_ordered_values = df_train_scaled[ordered_features_list].values
-    df_test_scaled_ordered_values = df_test_scaled[ordered_features_list].values
-    
-    n_features = len(ordered_features_list)
-    target_col_idx_in_ordered = ordered_features_list.index(target_col_name)
-    
-    x_train, y_train = create_sequences_from_data(df_train_scaled_ordered_values, n_past, n_features, target_col_idx_in_ordered)
-    x_test, y_test = create_sequences_from_data(df_test_scaled_ordered_values, n_past, n_features, target_col_idx_in_ordered)
-    
-    # Ensure float32 type for Keras
-    x_train = x_train.astype('float32')
-    y_train = y_train.astype('float32')
-    x_test = x_test.astype('float32')
-    y_test = y_test.astype('float32')
-    
-    return x_train, y_train, x_test, y_test, scaler
+    One factor per month (not per day) preserves the "monthly total" semantics.
+    Simulates the noisy external monthly forecast seen in production.
+    """
+    months = df.index.to_period('M')
+    unique_months = list(months.unique())
+    rng = np.random.default_rng(seed)
+    factors = rng.normal(1.0, noise_std, size=len(unique_months))
+    factor_map = dict(zip(unique_months, factors))
+    factor_series = pd.Series([factor_map[m] for m in months], index=df.index)
+
+    df = df.copy()
+    df['monthly_sum'] = df['monthly_sum'] * factor_series
+    return df
+
 
 def create_sequences_from_data(dataset_values, n_past, n_features_expected, target_col_idx):
-    # Creates X, Y sequences from numpy array data.
-    data_x, data_y = [], []
+    """Emit windowed (X, y): X has shape (n_past, n_features); y is the next target."""
     if len(dataset_values) <= n_past:
-        print(f"Warning: Dataset length {len(dataset_values)} too short for n_past={n_past}")
-        return np.array(data_x), np.array(data_y) # Will be converted to float32 by caller
+        print(f"Warning: dataset length {len(dataset_values)} too short for n_past={n_past}")
+        return np.empty((0, n_past, n_features_expected)), np.empty((0,))
 
     if dataset_values.shape[1] != n_features_expected:
-         raise ValueError(f"Dataset has {dataset_values.shape[1]} features, expected {n_features_expected}")
+        raise ValueError(
+            f"Dataset has {dataset_values.shape[1]} features, expected {n_features_expected}"
+        )
 
+    data_x, data_y = [], []
     for i in range(n_past, len(dataset_values)):
         data_x.append(dataset_values[i - n_past:i, :])
         data_y.append(dataset_values[i, target_col_idx])
-    return np.array(data_x), np.array(data_y) # Caller will astype to float32
+    return np.array(data_x), np.array(data_y)
 
-# --- Model Building Functions ---
+
+def scale_data_and_create_sequences(df_full, train_ratio, n_past, cols_to_scale_list,
+                                    ordered_features_list, target_col_name):
+    """Split, scale (fit on train only), and emit windowed (X, y) arrays."""
+    split_idx = int(len(df_full) * train_ratio)
+    df_train = df_full.iloc[:split_idx]
+    df_test = df_full.iloc[split_idx:]
+
+    print(f"Training set size: {len(df_train)}, Testing set size: {len(df_test)}")
+
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    df_train_scaled = df_train.copy()
+    df_test_scaled = df_test.copy()
+    df_train_scaled[cols_to_scale_list] = scaler.fit_transform(df_train[cols_to_scale_list])
+    if not df_test.empty:
+        df_test_scaled[cols_to_scale_list] = scaler.transform(df_test[cols_to_scale_list])
+
+    train_values = df_train_scaled[list(ordered_features_list)].values
+    test_values = df_test_scaled[list(ordered_features_list)].values
+
+    n_features = len(ordered_features_list)
+    target_col_idx = ordered_features_list.index(target_col_name)
+
+    x_train, y_train = create_sequences_from_data(train_values, n_past, n_features, target_col_idx)
+    x_test, y_test = create_sequences_from_data(test_values, n_past, n_features, target_col_idx)
+
+    return (
+        x_train.astype('float32'),
+        y_train.astype('float32'),
+        x_test.astype('float32'),
+        y_test.astype('float32'),
+        scaler,
+    )
+
 
 def build_keras_model(input_shape_tuple, optimizer_name='adam', learning_rate=0.001, l2_coeff=0.01):
-    """Builds the Keras Conv1D + LSTM model."""
-    if optimizer_name.lower() == 'adam':
-        opt = Adam(learning_rate=learning_rate)
-    elif optimizer_name.lower() == 'nadam':
+    """Conv1D feature extraction -> stacked LSTM -> Dense regression head."""
+    if optimizer_name.lower() == 'nadam':
         opt = Nadam(learning_rate=learning_rate)
     else:
-        opt = Adam(learning_rate=learning_rate) 
+        opt = Adam(learning_rate=learning_rate)
 
-    model = Sequential(name="Conv1D_LSTM_Model_Script_Refactored")
+    model = Sequential(name="Conv1D_LSTM_Model")
     model.add(Input(shape=input_shape_tuple, name="Input_Layer"))
-    model.add(Conv1D(filters=64, kernel_size=5, padding='same', activation='relu', kernel_initializer="glorot_uniform", name="Conv1D_1"))
+    model.add(Conv1D(64, 5, padding='same', activation='relu',
+                     kernel_initializer="glorot_uniform", name="Conv1D_1"))
     model.add(Dropout(0.1, name="Dropout_Conv"))
-    model.add(Conv1D(filters=32, kernel_size=3, padding='same', activation='relu', kernel_initializer="glorot_uniform", name="Conv1D_2"))
+    model.add(Conv1D(32, 3, padding='same', activation='relu',
+                     kernel_initializer="glorot_uniform", name="Conv1D_2"))
     model.add(LSTM(64, return_sequences=True, kernel_regularizer=l2(l2_coeff), name="LSTM_1"))
     model.add(Dropout(0.2, name="Dropout_1"))
     model.add(LSTM(32, return_sequences=True, kernel_regularizer=l2(l2_coeff), name="LSTM_2"))
@@ -208,337 +239,337 @@ def build_keras_model(input_shape_tuple, optimizer_name='adam', learning_rate=0.
     model.compile(loss='mse', optimizer=opt, metrics=['mae', 'mse'])
     return model
 
-# --- Main Script Execution ---
+
+def _evaluate_cv_model(model, scaler, X_test, y_test, df_historical):
+    """Evaluate the best CV model, plot actual vs predicted, print metrics."""
+    loss_s, mae_s, _ = model.evaluate(X_test, y_test, verbose=0)
+    print(f"  Scaled Test Loss (MSE): {loss_s:.4f}")
+    print(f"  Scaled Test MAE: {mae_s:.4f}")
+
+    preds_scaled = model.predict(X_test).flatten()
+    target_idx_in_scaled = COLUMNS_TO_SCALE.index(TARGET_COLUMN_NAME)
+
+    temp_preds = np.zeros((len(preds_scaled), len(COLUMNS_TO_SCALE)))
+    temp_preds[:, target_idx_in_scaled] = preds_scaled
+    preds_original = scaler.inverse_transform(temp_preds)[:, target_idx_in_scaled]
+
+    temp_actuals = np.zeros((len(y_test), len(COLUMNS_TO_SCALE)))
+    temp_actuals[:, target_idx_in_scaled] = y_test
+    actual_original = scaler.inverse_transform(temp_actuals)[:, target_idx_in_scaled]
+
+    mae_orig = mean_absolute_error(actual_original, preds_original)
+    mse_orig = mean_squared_error(actual_original, preds_original)
+    rmse_orig = np.sqrt(mse_orig)
+    print(f"  Original-scale MAE: {mae_orig:.2f}")
+    print(f"  Original-scale MSE: {mse_orig:.2f}")
+    print(f"  Original-scale RMSE: {rmse_orig:.2f}")
+
+    plot_start = int(len(df_historical) * TRAIN_SPLIT_RATIO_CV) + N_PAST_STEPS
+    plot_dates = df_historical.iloc[plot_start:plot_start + len(actual_original)].index
+    plt.figure(figsize=(15, 6))
+    plt.plot(plot_dates, actual_original, label='Actual (original scale)')
+    plt.plot(plot_dates, preds_original, label='Predicted (original scale)', alpha=0.7)
+    plt.title('CV Test Set: Actual vs Predicted')
+    plt.xlabel('Date')
+    plt.ylabel(TARGET_COLUMN_NAME)
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(CV_TEST_PLOT, dpi=150)
+    plt.close()
+    print(f"Plot saved to {CV_TEST_PLOT}")
+
+
+def _build_future_frame(df_holidays, df_historical, pred_dates):
+    """Assemble future-side feature frame from exogenous CSVs + calendar."""
+    df_future_exog = pd.read_csv(FUTURE_ROLLCAP_FILE, parse_dates=['date'])
+
+    df_future = pd.DataFrame({'date': pred_dates})
+    df_future = pd.merge(df_future, df_future_exog[['date', 'RollCap']], on='date', how='left')
+    df_future['RollCap'] = df_future['RollCap'].ffill().bfill().fillna(0)
+
+    df_future = pd.merge(df_future, df_holidays, on='date', how='left')
+    df_future['Holiday_A'] = df_future['Holiday_A'].fillna(0).astype(int)
+    df_future['Holiday_B'] = df_future['Holiday_B'].fillna(0).astype(int)
+
+    df_future = df_future.set_index(pd.to_datetime(df_future['date']))
+    df_future['weekday'] = df_future.index.dayofweek
+    df_future['week_number'] = df_future.index.isocalendar().week.astype(int)
+    df_future['month'] = df_future.index.month
+
+    try:
+        df_future_ms = pd.read_csv(FUTURE_MONTH_SUM_FILE, parse_dates=['date'])
+        df_future_ms['month_start_key'] = pd.to_datetime(df_future_ms['date']).dt.to_period('M').dt.to_timestamp()
+        df_future_ms = df_future_ms.rename(columns={'monthly_sum': 'monthly_sum_future_val'})
+
+        df_future['month_start_key'] = df_future.index.to_period('M').to_timestamp()
+        df_future = df_future.reset_index(drop=True).merge(
+            df_future_ms[['month_start_key', 'monthly_sum_future_val']],
+            on='month_start_key', how='left',
+        )
+        df_future = df_future.rename(columns={'monthly_sum_future_val': 'monthly_sum'})
+        df_future['monthly_sum'] = df_future['monthly_sum'].ffill().bfill().fillna(0)
+        df_future = df_future.set_index(pd.to_datetime(df_future['date']))
+        df_future.drop(columns=['month_start_key', 'date'], inplace=True, errors='ignore')
+    except FileNotFoundError:
+        print(f"Warning: {FUTURE_MONTH_SUM_FILE} not found; future monthly_sum will be 0.")
+        df_future['monthly_sum'] = 0
+
+    df_future[TARGET_COLUMN_NAME] = 0
+    for col in FEATURE_ORDER:
+        if col not in df_future.columns:
+            df_future[col] = 0
+    return df_future[list(FEATURE_ORDER)]
+
+
+def _predict_future(model, scaler, df_historical, df_future_for_pred, pred_dates):
+    """Iteratively predict the future horizon one step at a time."""
+    last_hist_window = df_historical[list(FEATURE_ORDER)].values[-N_PAST_STEPS:]
+    combined_unscaled = np.concatenate((last_hist_window, df_future_for_pred.values))
+
+    combined_df = pd.DataFrame(combined_unscaled, columns=list(FEATURE_ORDER))
+    combined_scaled = combined_df.copy()
+    combined_scaled[COLUMNS_TO_SCALE] = scaler.transform(combined_df[COLUMNS_TO_SCALE])
+    input_array = combined_scaled.values.astype('float32')
+
+    target_idx = FEATURE_ORDER.index(TARGET_COLUMN_NAME)
+    preds_scaled = []
+    for i in range(N_PAST_STEPS, len(input_array)):
+        window = input_array[i - N_PAST_STEPS:i, :].reshape(1, N_PAST_STEPS, N_FEATURES)
+        pred = model.predict(window, verbose=0)[0, 0]
+        preds_scaled.append(pred)
+        input_array[i, target_idx] = pred
+
+    preds_np = np.array(preds_scaled).reshape(-1, 1)
+    target_idx_in_scaled = COLUMNS_TO_SCALE.index(TARGET_COLUMN_NAME)
+    dummy = np.zeros((len(preds_np), len(COLUMNS_TO_SCALE)))
+    dummy[:, target_idx_in_scaled] = preds_np.flatten()
+    preds_original = scaler.inverse_transform(dummy)[:, target_idx_in_scaled]
+    preds_original_int = np.round(preds_original).astype(int)
+
+    df_forecast = pd.DataFrame({
+        'date': pred_dates,
+        f'{TARGET_COLUMN_NAME}_forecast': preds_original_int,
+    })
+    print("\nFuture forecast (first 5 rows):")
+    print(df_forecast.head())
+
+    plt.figure(figsize=(15, 7))
+    plt.plot(df_historical.index[-60:], df_historical[TARGET_COLUMN_NAME].iloc[-60:],
+             label='Historical actual')
+    plt.plot(df_forecast['date'], df_forecast[f'{TARGET_COLUMN_NAME}_forecast'],
+             label='Future forecast')
+    plt.title('Forecast vs Historical')
+    plt.xlabel('Date')
+    plt.ylabel(TARGET_COLUMN_NAME)
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(FORECAST_PLOT, dpi=150)
+    plt.close()
+    print(f"Plot saved to {FORECAST_PLOT}")
+    return df_forecast
+
+
 def run_forecast_pipeline():
-    """Main function to run the entire forecasting pipeline."""
     print("--- Starting Forecasting Pipeline ---")
+    tf.keras.utils.set_random_seed(PIPELINE_SEED)
 
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"Successfully configured {len(gpus)} GPUs with memory growth.")
-        except RuntimeError as e:
-            print(f"Error during GPU memory growth configuration: {e}")
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"Configured {len(gpus)} GPU(s) with memory growth.")
     else:
-        print("No GPUs detected by TensorFlow. Running on CPU.")
+        print("No GPUs detected. Running on CPU.")
 
-    print("\n[PHASE 1] Loading and Preprocessing Data...")
-    df_holidays_processed = load_holidays_data(HOLIDAY_YEARS, HOLIDAY_A_NAMES, US_HOLIDAYS_SUBSET)
-    df_historical, ALL_FEATURES_ORDERED_LIST = engineer_features_historical(HISTORICAL_DATA_FILE, df_holidays_processed)
-    
-    N_FEATURES_DYNAMIC = len(ALL_FEATURES_ORDERED_LIST)
-    print(f"Data loaded. Number of features: {N_FEATURES_DYNAMIC}. Feature order: {ALL_FEATURES_ORDERED_LIST}")
+    print("\n[PHASE 1] Loading and preprocessing data...")
+    df_holidays = load_holidays_data(HOLIDAY_YEARS, HOLIDAY_A_NAMES, US_HOLIDAYS_SUBSET)
+    df_historical = engineer_features_historical(HISTORICAL_DATA_FILE, df_holidays)
+    print(f"Number of features: {N_FEATURES}. Feature order: {list(FEATURE_ORDER)}")
 
     if df_historical.isnull().values.any():
-        print("\nWARNING: NaNs detected in historical data after feature engineering!")
-        print(df_historical.isnull().sum())
-        print("Attempting to fill NaNs with median/mode or ffill/bfill. Review carefully.")
+        print("WARNING: NaNs detected; filling with median / ffill / bfill.")
         for col in df_historical.columns:
             if df_historical[col].isnull().any():
                 if pd.api.types.is_numeric_dtype(df_historical[col]):
                     df_historical[col] = df_historical[col].fillna(df_historical[col].median())
-                else: 
-                    df_historical[col] = df_historical[col].fillna(df_historical[col].mode()[0]) 
+                else:
+                    df_historical[col] = df_historical[col].fillna(df_historical[col].mode()[0])
         df_historical = df_historical.ffill().bfill().fillna(0)
         if df_historical.isnull().values.any():
-            print("FATAL: NaNs persist after fill attempts. Exiting.")
-            return
-        else:
-            print("NaNs filled.")
+            raise RuntimeError("NaNs persist after fill; aborting.")
 
-    print("\n[PHASE 2] Data Prep for CV and Direct Fit Debug...") # Renamed phase slightly
+    df_historical = inject_monthly_sum_noise(df_historical)
+    print(f"Applied monthly_sum noise (std={MONTHLY_SUM_NOISE_STD}, seed={MONTHLY_SUM_NOISE_SEED}).")
+
+    print("\n[PHASE 2] Scaling and creating sequences for CV...")
     X_train_cv, y_train_cv, X_test_cv, y_test_cv, scaler_cv_obj = scale_data_and_create_sequences(
         df_historical,
         TRAIN_SPLIT_RATIO_CV,
         N_PAST_STEPS,
         COLUMNS_TO_SCALE,
-        ALL_FEATURES_ORDERED_LIST,
-        TARGET_COLUMN_NAME
+        FEATURE_ORDER,
+        TARGET_COLUMN_NAME,
     )
 
-    if X_train_cv.size == 0 : # Simplified check
-        print("ERROR: Not enough data to create X_train_cv sequences. Exiting.")
-        return
-        
-    print(f"trainX_cv shape: {X_train_cv.shape}, trainY_cv shape: {y_train_cv.shape}")
-    if X_test_cv.size > 0:
-        print(f"testX_cv shape: {X_test_cv.shape}, testY_cv shape: {y_test_cv.shape}")
-    else:
-        print("testX_cv or y_test_cv is empty.")
+    if X_train_cv.size == 0:
+        raise RuntimeError("Not enough data to create X_train_cv sequences.")
 
-    current_model_input_shape = (N_PAST_STEPS, N_FEATURES_DYNAMIC)
+    print(f"trainX_cv: {X_train_cv.shape}, trainY_cv: {y_train_cv.shape}")
+    if X_test_cv.size:
+        print(f"testX_cv: {X_test_cv.shape}, testY_cv: {y_test_cv.shape}")
 
-    # --- Phase 3: GridSearchCV ---
-    print("\n[PHASE 3] Hyperparameter Tuning with GridSearchCV (Using original complex model)...")
+    model_input_shape = (N_PAST_STEPS, N_FEATURES)
+
+    print("\n[PHASE 3] Hyperparameter search (manual TimeSeriesSplit CV)...")
     try:
-        with open(SCALER_CV_PKL, 'wb') as f: # Save scaler before potential crash in GridSearchCV
+        with open(SCALER_CV_PKL, 'wb') as f:
             pickle.dump(scaler_cv_obj, f)
-        print(f"CV Scaler saved to {SCALER_CV_PKL}")
-    except Exception as e:
-        print(f"Error saving CV scaler: {e}")
+        print(f"CV scaler saved to {SCALER_CV_PKL}")
+    except OSError as e:
+        print(f"Warning: could not save CV scaler: {e}")
 
-    keras_estimator_cv = KerasRegressor(
-        model=build_keras_model, # Using the original complex model builder
-        model__input_shape_tuple=current_model_input_shape, 
-        loss="mse", 
-        verbose=1, # INCREASED Keras verbosity during fit
+    combos = list(ParameterGrid(GRID_SEARCH_PARAMS))
+    tscv = TimeSeriesSplit(n_splits=CV_N_SPLITS)
+    print(f"Evaluating {len(combos)} combos × {CV_N_SPLITS} folds = {len(combos) * CV_N_SPLITS} total fits")
+
+    best_params = None
+    best_cv_mse = np.inf
+    for combo_idx, combo in enumerate(combos, 1):
+        fold_scores = []
+        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X_train_cv), 1):
+            tf.keras.backend.clear_session()
+            model = build_keras_model(
+                input_shape_tuple=model_input_shape,
+                optimizer_name=combo['optimizer'],
+                learning_rate=combo['learning_rate'],
+                l2_coeff=combo['l2_coeff'],
+            )
+            model.fit(
+                X_train_cv[train_idx], y_train_cv[train_idx],
+                epochs=combo['epochs'],
+                batch_size=combo['batch_size'],
+                verbose=0,
+                callbacks=[EarlyStopping(monitor='loss', patience=EARLY_STOPPING_PATIENCE,
+                                         restore_best_weights=True, verbose=0)],
+            )
+            preds = model.predict(X_train_cv[val_idx], verbose=0).flatten()
+            fold_mse = mean_squared_error(y_train_cv[val_idx], preds)
+            fold_scores.append(fold_mse)
+            del model
+        mean_mse = float(np.mean(fold_scores))
+        print(f"  combo {combo_idx}/{len(combos)} {combo} -> mean_MSE={mean_mse:.5f}")
+        if mean_mse < best_cv_mse:
+            best_cv_mse = mean_mse
+            best_params = combo
+
+    print(f"\nBest CV params: {best_params}")
+    print(f"Best CV MSE (scaled): {best_cv_mse:.5f}")
+
+    # Refit best params on the FULL X_train_cv so we have one model to evaluate
+    # against X_test_cv (the held-out 5% tail).
+    tf.keras.backend.clear_session()
+    best_cv_model = build_keras_model(
+        input_shape_tuple=model_input_shape,
+        optimizer_name=best_params['optimizer'],
+        learning_rate=best_params['learning_rate'],
+        l2_coeff=best_params['l2_coeff'],
+    )
+    best_cv_model.fit(
+        X_train_cv, y_train_cv,
+        epochs=best_params['epochs'],
+        batch_size=best_params['batch_size'],
+        verbose=0,
+        callbacks=[EarlyStopping(monitor='loss', patience=EARLY_STOPPING_PATIENCE,
+                                 restore_best_weights=True, verbose=0)],
+    )
+    best_cv_params = best_params
+
+    if X_test_cv.size and y_test_cv.size:
+        print("\nEvaluating best CV model on the held-out CV test set...")
+        _evaluate_cv_model(best_cv_model, scaler_cv_obj, X_test_cv, y_test_cv, df_historical)
+
+    # --- Phase 4: Final model on all historical data ---
+    print("\n[PHASE 4] Training final model on all historical data...")
+    scaler_final_obj = MinMaxScaler(feature_range=(0, 1))
+    df_historical_final_scaled = df_historical.copy()
+    df_historical_final_scaled[COLUMNS_TO_SCALE] = scaler_final_obj.fit_transform(
+        df_historical[COLUMNS_TO_SCALE]
     )
 
-    tscv_cv = TimeSeriesSplit(n_splits=CV_N_SPLITS)
-    
-    grid_search_obj = GridSearchCV(
-        estimator=keras_estimator_cv,
-        param_grid=GRID_SEARCH_PARAMS,
-        cv=tscv_cv,
-        scoring='neg_mean_squared_error',
-        verbose=2,
-        error_score='raise'
-    )
+    try:
+        with open(SCALER_FINAL_PKL, 'wb') as f:
+            pickle.dump(scaler_final_obj, f)
+        print(f"Final scaler saved to {SCALER_FINAL_PKL}")
+    except OSError as e:
+        print(f"Warning: could not save final scaler: {e}")
 
-    early_stopping_callback_cv = EarlyStopping(
+    X_all_hist, y_all_hist = create_sequences_from_data(
+        df_historical_final_scaled[list(FEATURE_ORDER)].values,
+        N_PAST_STEPS,
+        N_FEATURES,
+        FEATURE_ORDER.index(TARGET_COLUMN_NAME),
+    )
+    print(f"Full historical X: {X_all_hist.shape}, y: {y_all_hist.shape}")
+
+    tf.keras.backend.clear_session()
+    final_model = build_keras_model(
+        input_shape_tuple=model_input_shape,
+        optimizer_name=best_cv_params['optimizer'],
+        learning_rate=best_cv_params['learning_rate'],
+        l2_coeff=best_cv_params.get('l2_coeff', FIXED_L2_COEFF),
+    )
+    # Final training uses a 10% trailing validation slice for EarlyStopping —
+    # Keras's validation_split takes the LAST fraction, which is time-ordered.
+    early_stopping_final = EarlyStopping(
         monitor='val_loss', patience=EARLY_STOPPING_PATIENCE, verbose=1, restore_best_weights=True
     )
+    final_model.fit(
+        X_all_hist,
+        y_all_hist,
+        epochs=best_cv_params['epochs'],
+        batch_size=best_cv_params['batch_size'],
+        callbacks=[early_stopping_final],
+        validation_split=0.1,
+        verbose=1,
+    )
+    print("Final model training complete.")
 
-    best_cv_model = None
-    best_cv_params = None
-
-    print("\nStarting GridSearchCV fit (with complex model)...")
     try:
-        grid_search_obj.fit(X_train_cv, y_train_cv, callbacks=[early_stopping_callback_cv], validation_split=0.1)
-        print("\nGridSearchCV completed!")
-        print(f"Best parameters found: {grid_search_obj.best_params_}")
-        print(f"Best CV score (neg_mean_squared_error): {grid_search_obj.best_score_:.4f}")
-        
-        best_cv_model = grid_search_obj.best_estimator_.model_
-        best_cv_params = grid_search_obj.best_params_
-
-        if X_test_cv.size > 0 and y_test_cv.size > 0:
-            print("\nEvaluating best model from CV on the CV test set...")
-            # ... (evaluation logic from your script, remains the same) ...
-            loss_s, mae_s, mse_s = best_cv_model.evaluate(X_test_cv, y_test_cv, verbose=0)
-            print(f"  Scaled Test Loss (MSE from model): {loss_s:.4f}")
-            print(f"  Scaled Test MAE: {mae_s:.4f}")
-
-            preds_scaled_cv = best_cv_model.predict(X_test_cv).flatten()
-            
-            temp_preds = np.zeros((len(preds_scaled_cv), len(COLUMNS_TO_SCALE)))
-            target_idx_in_scaled_cols = COLUMNS_TO_SCALE.index(TARGET_COLUMN_NAME)
-            temp_preds[:, target_idx_in_scaled_cols] = preds_scaled_cv
-            preds_original_cv = scaler_cv_obj.inverse_transform(temp_preds)[:, target_idx_in_scaled_cols]
-
-            temp_actuals = np.zeros((len(y_test_cv), len(COLUMNS_TO_SCALE)))
-            temp_actuals[:, target_idx_in_scaled_cols] = y_test_cv
-            actual_original_cv = scaler_cv_obj.inverse_transform(temp_actuals)[:, target_idx_in_scaled_cols]
-
-            mae_orig = mean_absolute_error(actual_original_cv, preds_original_cv)
-            mse_orig = mean_squared_error(actual_original_cv, preds_original_cv)
-            rmse_orig = np.sqrt(mse_orig)
-            print(f"  Original Scale Test MAE: {mae_orig:.2f}")
-            print(f"  Original Scale Test MSE: {mse_orig:.2f}")
-            print(f"  Original Scale Test RMSE: {rmse_orig:.2f}")
-
-            plt.figure(figsize=(15, 6))
-            plot_dates_cv_test = df_historical.iloc[int(len(df_historical) * TRAIN_SPLIT_RATIO_CV):].index[N_PAST_STEPS:N_PAST_STEPS+len(actual_original_cv)]
-            plt.plot(plot_dates_cv_test, actual_original_cv, label='Actual (Original Scale)')
-            plt.plot(plot_dates_cv_test, preds_original_cv, label='Predicted (Original Scale)', alpha=0.7)
-            plt.title('CV Test Set: Actual vs. Predicted (Original Scale)')
-            plt.xlabel('Date'); plt.ylabel(TARGET_COLUMN_NAME); plt.legend()
-            plt.xticks(rotation=45); plt.tight_layout()
-            plt.savefig(os.path.join(BASE_DIR, 'cv_test_actual_vs_predicted.png'), dpi=150)
-            plt.close()
-            print("Plot saved to cv_test_actual_vs_predicted.png")
-
-    except Exception as e:
-        print(f"An error occurred during GridSearchCV or evaluation: {e}")
-        traceback.print_exc()
-    
-    # --- Phase 4: (Optional) Train Final Model on All Historical Data ---
-    model_for_future_prediction = None
-    scaler_for_future_prediction = None # Initialize
-
-    if best_cv_params:
-        print("\n[PHASE 4] Training Final Model on All Historical Data...")
-        # ... (logic for training final model, remains largely the same) ...
-        # ... ensure scaler_final_obj is defined and used ...
-        scaler_final_obj = MinMaxScaler(feature_range=(0,1)) # Define it here
-        df_historical_final_scaled = df_historical.copy()
-        df_historical_final_scaled[COLUMNS_TO_SCALE] = scaler_final_obj.fit_transform(df_historical[COLUMNS_TO_SCALE])
-        
-        try:
-            with open(SCALER_FINAL_PKL, 'wb') as f: pickle.dump(scaler_final_obj, f)
-            print(f"Final scaler saved to {SCALER_FINAL_PKL}")
-        except Exception as e: print(f"Error saving final scaler: {e}")
-
-        X_all_hist, y_all_hist = create_sequences_from_data(
-            df_historical_final_scaled[ALL_FEATURES_ORDERED_LIST].values,
-            N_PAST_STEPS, N_FEATURES_DYNAMIC, 
-            ALL_FEATURES_ORDERED_LIST.index(TARGET_COLUMN_NAME)
-        )
-        print(f"Full historical X shape: {X_all_hist.shape}, Y shape: {y_all_hist.shape}")
-
-        if X_all_hist.size > 0:
-            print("Building and training the final model with best CV parameters...")
-            final_model = build_keras_model( # Use the original complex model
-                input_shape_tuple=current_model_input_shape, 
-                optimizer_name=best_cv_params['optimizer'],
-                learning_rate=best_cv_params['optimizer__learning_rate'],
-                l2_coeff=best_cv_params.get('model__l2_coeff', FIXED_L2_COEFF) 
-            )
-            # ... (rest of final model training) ...
-            early_stopping_final_train = EarlyStopping(
-                monitor='val_loss', patience=EARLY_STOPPING_PATIENCE, verbose=1, restore_best_weights=True
-            )
-            final_model.fit(
-                X_all_hist, y_all_hist,
-                epochs=best_cv_params['epochs'],
-                batch_size=best_cv_params['batch_size'],
-                callbacks=[early_stopping_final_train],
-                validation_split=0.1,
-                verbose=1
-            )
-            print("Final model training complete.")
-            try:
-                final_model.save(MODEL_FINAL_KERAS)
-                print(f"Final model saved to {MODEL_FINAL_KERAS}")
-                model_for_future_prediction = final_model
-                scaler_for_future_prediction = scaler_final_obj
-            except Exception as e: print(f"Error saving final model: {e}")
-        else:
-            print("Skipping final model training: No sequences from full historical data.")
-    else:
-        print("\nSkipping final model training: Best parameters from CV not available.")
-
-    if model_for_future_prediction is None and best_cv_model is not None:
-        print("Using best model from CV for future predictions as final model training was skipped or failed.")
+        final_model.save(MODEL_FINAL_KERAS)
+        print(f"Final model saved to {MODEL_FINAL_KERAS}")
+        model_for_future_prediction = final_model
+        scaler_for_future_prediction = scaler_final_obj
+    except OSError as e:
+        print(f"Warning: could not save final model: {e}. Falling back to CV-best model.")
         model_for_future_prediction = best_cv_model
-        scaler_for_future_prediction = scaler_cv_obj 
-    elif model_for_future_prediction is None: 
-        if os.path.exists(MODEL_FINAL_KERAS) and os.path.exists(SCALER_FINAL_PKL):
-            try:
-                print(f"Loading production model from {MODEL_FINAL_KERAS} and scaler from {SCALER_FINAL_PKL}")
-                model_for_future_prediction = tf.keras.models.load_model(MODEL_FINAL_KERAS)
-                with open(SCALER_FINAL_PKL, 'rb') as f:
-                    scaler_for_future_prediction = pickle.load(f)
-                print("Loaded production model and scaler successfully.")
-            except Exception as e:
-                print(f"Error loading production model/scaler: {e}")
-        else:
-            print("No model available for prediction (final training skipped/failed, and no saved model found).")
+        scaler_for_future_prediction = scaler_cv_obj
 
-    # --- Phase 5: Future Prediction ---
-    if model_for_future_prediction and scaler_for_future_prediction:
-        print("\n[PHASE 5] Generating Future Predictions...")
-        # ... (future prediction logic, remains largely the same) ...
-        print("Loading and preparing future exogenous data...")
-        try:
-            df_future_exog = pd.read_csv(FUTURE_ROLLCAP_FILE, parse_dates=['date'])
-        except FileNotFoundError:
-            print(f"ERROR: Future RollCap file not found: {FUTURE_ROLLCAP_FILE}. Cannot make future predictions.")
-            return
-
-        pred_start_date = df_historical.index.max() + pd.Timedelta(days=1)
-        num_pred_periods = len(df_future_exog) 
-        pred_dates = pd.date_range(start=pred_start_date, periods=num_pred_periods)
-
-        df_future_base = pd.DataFrame({'date': pred_dates})
-        df_future_base = pd.merge(df_future_base, df_future_exog[['date', 'RollCap']], on='date', how='left')
-        df_future_base['RollCap'] = df_future_base['RollCap'].ffill().bfill().fillna(0) 
-
-        df_future_base = pd.merge(df_future_base, df_holidays_processed, on='date', how='left')
-        df_future_base['Holiday_A'] = df_future_base['Holiday_A'].fillna(0).astype(int)
-        df_future_base['Holiday_B'] = df_future_base['Holiday_B'].fillna(0).astype(int)
-        
-        df_future_base['date_dt_temp'] = pd.to_datetime(df_future_base['date']) 
-        df_future_base = df_future_base.set_index('date_dt_temp')
-        df_future_base['weekday'] = df_future_base.index.dayofweek
-        df_future_base['week_number'] = df_future_base.index.isocalendar().week.astype(int)
-        df_future_base['month'] = df_future_base.index.month
-        
-        try:
-            df_future_monthly_sums = pd.read_csv(FUTURE_MONTH_SUM_FILE, parse_dates=['date'])
-            df_future_monthly_sums.rename(columns={'date': 'month_start_key', 'monthly_sum': 'monthly_sum_future_val'}, inplace=True)
-            df_future_monthly_sums['month_start_key'] = pd.to_datetime(df_future_monthly_sums['month_start_key']).dt.to_period('M').dt.to_timestamp()
-
-            df_future_base['month_start_key'] = df_future_base.index.to_period('M').to_timestamp()
-            df_future_base = pd.merge(df_future_base.reset_index(), 
-                                    df_future_monthly_sums[['month_start_key', 'monthly_sum_future_val']],
-                                    on='month_start_key',
-                                    how='left')
-            df_future_base.rename(columns={'monthly_sum_future_val': 'monthly_sum'}, inplace=True)
-            df_future_base['monthly_sum'] = df_future_base['monthly_sum'].ffill().bfill().fillna(0)
-            df_future_base = df_future_base.set_index('date_dt_temp') 
-            df_future_base.drop(columns=['month_start_key', 'date'], errors='ignore', inplace=True)
-
-        except FileNotFoundError:
-            print(f"Warning: {FUTURE_MONTH_SUM_FILE} not found. Future 'monthly_sum' will be 0.")
-            df_future_base['monthly_sum'] = 0
-        except Exception as e:
-            print(f"Error processing future monthly sums: {e}. Future 'monthly_sum' will be 0.")
-            df_future_base['monthly_sum'] = 0
-            
-        df_future_base[TARGET_COLUMN_NAME] = 0 
-
-        for col in ALL_FEATURES_ORDERED_LIST:
-            if col not in df_future_base.columns:
-                df_future_base[col] = 0
-        df_future_for_pred = df_future_base[ALL_FEATURES_ORDERED_LIST]
-
-        df_historical_ordered = df_historical[ALL_FEATURES_ORDERED_LIST]
-        last_hist_window_unscaled = df_historical_ordered.values[-N_PAST_STEPS:]
-        
-        combined_unscaled_for_pred_loop = np.concatenate(
-            (last_hist_window_unscaled, df_future_for_pred.values)
+    # --- Phase 5: Future prediction ---
+    print("\n[PHASE 5] Generating future predictions...")
+    try:
+        df_future_exog = pd.read_csv(FUTURE_ROLLCAP_FILE, parse_dates=['date'])
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Future RollCap file not found: {FUTURE_ROLLCAP_FILE}. "
+            "Run generate_rollcap_dummy_data.py first."
         )
-        
-        combined_df_for_pred_loop = pd.DataFrame(combined_unscaled_for_pred_loop, columns=ALL_FEATURES_ORDERED_LIST)
-        combined_df_for_pred_loop_scaled = combined_df_for_pred_loop.copy()
-        combined_df_for_pred_loop_scaled[COLUMNS_TO_SCALE] = scaler_for_future_prediction.transform(
-            combined_df_for_pred_loop[COLUMNS_TO_SCALE]
-        )
-        
-        input_array_for_pred_loop = combined_df_for_pred_loop_scaled.values.astype('float32')
-        
-        print("Starting iterative prediction for future dates...")
-        all_future_preds_scaled = []
-        
-        for i in range(N_PAST_STEPS, len(input_array_for_pred_loop)): 
-            current_sequence = input_array_for_pred_loop[i-N_PAST_STEPS:i, :].reshape(1, N_PAST_STEPS, N_FEATURES_DYNAMIC)
-            predicted_value_scaled = model_for_future_prediction.predict(current_sequence, verbose=0)[0,0]
-            all_future_preds_scaled.append(predicted_value_scaled)
-            
-            if i < len(input_array_for_pred_loop): 
-                 input_array_for_pred_loop[i, ALL_FEATURES_ORDERED_LIST.index(TARGET_COLUMN_NAME)] = predicted_value_scaled
-        
-        all_future_preds_scaled_np = np.array(all_future_preds_scaled).reshape(-1, 1)
-        
-        dummy_for_inverse = np.zeros((len(all_future_preds_scaled_np), len(COLUMNS_TO_SCALE)))
-        target_idx_in_scaled_cols = COLUMNS_TO_SCALE.index(TARGET_COLUMN_NAME)
-        dummy_for_inverse[:, target_idx_in_scaled_cols] = all_future_preds_scaled_np.flatten()
-        
-        future_preds_original = scaler_for_future_prediction.inverse_transform(dummy_for_inverse)[:, target_idx_in_scaled_cols]
-        future_preds_original_int = np.round(future_preds_original).astype(int)
-        
-        df_forecast_results = pd.DataFrame({'date': pred_dates, f'{TARGET_COLUMN_NAME}_forecast': future_preds_original_int})
-        print("\nFuture Forecast Results:")
-        print(df_forecast_results.head())
 
-        plt.figure(figsize=(15,7))
-        plt.plot(df_historical.index[-60:], df_historical[TARGET_COLUMN_NAME].iloc[-60:], label='Historical Actual')
-        plt.plot(df_forecast_results['date'], df_forecast_results[f'{TARGET_COLUMN_NAME}_forecast'], label='Future Forecast')
-        plt.title('Forecast vs Historical'); plt.xlabel('Date'); plt.ylabel(TARGET_COLUMN_NAME); plt.legend()
-        plt.xticks(rotation=45); plt.tight_layout()
-        plt.savefig(os.path.join(BASE_DIR, 'forecast_vs_historical.png'), dpi=150)
-        plt.close()
-        print("Plot saved to forecast_vs_historical.png")
-    else:
-        print("\nSkipping Future Prediction phase as no model is available.")
+    pred_start_date = df_historical.index.max() + pd.Timedelta(days=1)
+    pred_dates = pd.date_range(start=pred_start_date, periods=len(df_future_exog))
+    df_future_for_pred = _build_future_frame(df_holidays, df_historical, pred_dates)
+
+    _predict_future(
+        model_for_future_prediction,
+        scaler_for_future_prediction,
+        df_historical,
+        df_future_for_pred,
+        pred_dates,
+    )
 
     print("\n--- Forecasting Pipeline Finished ---")
 
-# --- Script Entry Point ---
+
 if __name__ == '__main__':
-    # Optional: Set TF_ENABLE_ONEDNN_OPTS before importing TensorFlow if needed
-    # os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0' 
     run_forecast_pipeline()
