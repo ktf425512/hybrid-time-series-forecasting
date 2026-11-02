@@ -40,10 +40,6 @@ under-shoots the sharpest peaks.*
 *Iterative one-step-ahead forecast for 2025 appended to the last 60 days of
 history. The weekly pattern and the mid-year seasonal dip are both visible.*
 
-![Pre-refactor cover plot](assets/forecast_cover_clean_final.png)
-
-*Earlier version of the test-window plot, kept as the project cover image.*
-
 ## How to reproduce
 
 Requires Python 3.12 (`.python-version`). Everything runs on CPU in a few minutes.
