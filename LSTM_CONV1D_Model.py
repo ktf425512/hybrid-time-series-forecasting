@@ -9,6 +9,7 @@ monthly-total forecast (``future_Month_Sum.csv``) and the model learns the
 daily breakdown within it. See ``inject_monthly_sum_noise`` for the reason
 we perturb the training-time monthly_sum signal.
 """
+import argparse
 import os
 import pickle
 
@@ -30,16 +31,21 @@ from tensorflow.keras.regularizers import l2
 
 # --- Paths ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DATA_DIR = os.path.join(BASE_DIR, 'data')        # where generate_*.py write
+DEFAULT_OUTPUT_DIR = os.path.join(BASE_DIR, 'outputs')   # created on first run
 
-HISTORICAL_DATA_FILE = os.path.join(BASE_DIR, 'dummy_data.csv')
-FUTURE_ROLLCAP_FILE = os.path.join(BASE_DIR, 'mock_future_RollCap.csv')
-FUTURE_MONTH_SUM_FILE = os.path.join(BASE_DIR, 'future_Month_Sum.csv')
+# Inputs (relative to --data-dir)
+HISTORICAL_DATA_FILENAME = 'dummy_data.csv'
+FUTURE_ROLLCAP_FILENAME = 'mock_future_RollCap.csv'
+FUTURE_MONTH_SUM_FILENAME = 'future_Month_Sum.csv'
 
-SCALER_CV_PKL = os.path.join(BASE_DIR, 'scaler_cv_notebook_converted.pkl')
-SCALER_FINAL_PKL = os.path.join(BASE_DIR, 'scaler_final_notebook_converted.pkl')
-MODEL_FINAL_KERAS = os.path.join(BASE_DIR, 'model_final_notebook_converted.keras')
-CV_TEST_PLOT = os.path.join(BASE_DIR, 'cv_test_actual_vs_predicted.png')
-FORECAST_PLOT = os.path.join(BASE_DIR, 'forecast_vs_historical.png')
+# Outputs (relative to --output-dir)
+SCALER_CV_FILENAME = 'scaler_cv.pkl'
+SCALER_FINAL_FILENAME = 'scaler_final.pkl'
+MODEL_FINAL_FILENAME = 'model_final.keras'
+CV_TEST_PLOT_FILENAME = 'cv_test_actual_vs_predicted.png'
+FORECAST_PLOT_FILENAME = 'forecast_vs_historical.png'
+FORECAST_CSV_FILENAME = 'forecast.csv'
 
 # --- Holiday settings ---
 HOLIDAY_YEARS = list(range(2021, 2028))
@@ -240,7 +246,7 @@ def build_keras_model(input_shape_tuple, optimizer_name='adam', learning_rate=0.
     return model
 
 
-def _evaluate_cv_model(model, scaler, X_test, y_test, df_historical):
+def _evaluate_cv_model(model, scaler, X_test, y_test, df_historical, plot_path):
     """Evaluate the best CV model, plot actual vs predicted, print metrics."""
     loss_s, mae_s, _ = model.evaluate(X_test, y_test, verbose=0)
     print(f"  Scaled Test Loss (MSE): {loss_s:.4f}")
@@ -275,14 +281,14 @@ def _evaluate_cv_model(model, scaler, X_test, y_test, df_historical):
     plt.legend()
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig(CV_TEST_PLOT, dpi=150)
+    plt.savefig(plot_path, dpi=150)
     plt.close()
-    print(f"Plot saved to {CV_TEST_PLOT}")
+    print(f"Plot saved to {plot_path}")
 
 
-def _build_future_frame(df_holidays, df_historical, pred_dates):
+def _build_future_frame(df_holidays, pred_dates, rollcap_file, month_sum_file):
     """Assemble future-side feature frame from exogenous CSVs + calendar."""
-    df_future_exog = pd.read_csv(FUTURE_ROLLCAP_FILE, parse_dates=['date'])
+    df_future_exog = pd.read_csv(rollcap_file, parse_dates=['date'])
 
     df_future = pd.DataFrame({'date': pred_dates})
     df_future = pd.merge(df_future, df_future_exog[['date', 'RollCap']], on='date', how='left')
@@ -298,7 +304,7 @@ def _build_future_frame(df_holidays, df_historical, pred_dates):
     df_future['month'] = df_future.index.month
 
     try:
-        df_future_ms = pd.read_csv(FUTURE_MONTH_SUM_FILE, parse_dates=['date'])
+        df_future_ms = pd.read_csv(month_sum_file, parse_dates=['date'])
         df_future_ms['month_start_key'] = pd.to_datetime(df_future_ms['date']).dt.to_period('M').dt.to_timestamp()
         df_future_ms = df_future_ms.rename(columns={'monthly_sum': 'monthly_sum_future_val'})
 
@@ -312,7 +318,7 @@ def _build_future_frame(df_holidays, df_historical, pred_dates):
         df_future = df_future.set_index(pd.to_datetime(df_future['date']))
         df_future.drop(columns=['month_start_key', 'date'], inplace=True, errors='ignore')
     except FileNotFoundError:
-        print(f"Warning: {FUTURE_MONTH_SUM_FILE} not found; future monthly_sum will be 0.")
+        print(f"Warning: {month_sum_file} not found; future monthly_sum will be 0.")
         df_future['monthly_sum'] = 0
 
     df_future[TARGET_COLUMN_NAME] = 0
@@ -322,7 +328,8 @@ def _build_future_frame(df_holidays, df_historical, pred_dates):
     return df_future[list(FEATURE_ORDER)]
 
 
-def _predict_future(model, scaler, df_historical, df_future_for_pred, pred_dates):
+def _predict_future(model, scaler, df_historical, df_future_for_pred, pred_dates,
+                    plot_path, csv_path):
     """Iteratively predict the future horizon one step at a time."""
     last_hist_window = df_historical[list(FEATURE_ORDER)].values[-N_PAST_STEPS:]
     combined_unscaled = np.concatenate((last_hist_window, df_future_for_pred.values))
@@ -353,6 +360,8 @@ def _predict_future(model, scaler, df_historical, df_future_for_pred, pred_dates
     })
     print("\nFuture forecast (first 5 rows):")
     print(df_forecast.head())
+    df_forecast.to_csv(csv_path, index=False, date_format='%Y-%m-%d')
+    print(f"Forecast saved to {csv_path}")
 
     plt.figure(figsize=(15, 7))
     plt.plot(df_historical.index[-60:], df_historical[TARGET_COLUMN_NAME].iloc[-60:],
@@ -365,13 +374,33 @@ def _predict_future(model, scaler, df_historical, df_future_for_pred, pred_dates
     plt.legend()
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig(FORECAST_PLOT, dpi=150)
+    plt.savefig(plot_path, dpi=150)
     plt.close()
-    print(f"Plot saved to {FORECAST_PLOT}")
+    print(f"Plot saved to {plot_path}")
     return df_forecast
 
 
-def run_forecast_pipeline():
+def run_forecast_pipeline(data_dir=DEFAULT_DATA_DIR, output_dir=DEFAULT_OUTPUT_DIR, epochs=None):
+    """Run the full pipeline: features -> CV -> final fit -> 12-month forecast.
+
+    ``epochs`` overrides the single ``epochs`` value in GRID_SEARCH_PARAMS
+    (useful for a quick CPU check); None keeps the configured value.
+    """
+    historical_data_file = os.path.join(data_dir, HISTORICAL_DATA_FILENAME)
+    future_rollcap_file = os.path.join(data_dir, FUTURE_ROLLCAP_FILENAME)
+    future_month_sum_file = os.path.join(data_dir, FUTURE_MONTH_SUM_FILENAME)
+    os.makedirs(output_dir, exist_ok=True)
+    scaler_cv_pkl = os.path.join(output_dir, SCALER_CV_FILENAME)
+    scaler_final_pkl = os.path.join(output_dir, SCALER_FINAL_FILENAME)
+    model_final_keras = os.path.join(output_dir, MODEL_FINAL_FILENAME)
+    cv_test_plot = os.path.join(output_dir, CV_TEST_PLOT_FILENAME)
+    forecast_plot = os.path.join(output_dir, FORECAST_PLOT_FILENAME)
+    forecast_csv = os.path.join(output_dir, FORECAST_CSV_FILENAME)
+
+    grid_search_params = dict(GRID_SEARCH_PARAMS)
+    if epochs is not None:
+        grid_search_params['epochs'] = [epochs]
+
     print("--- Starting Forecasting Pipeline ---")
     tf.keras.utils.set_random_seed(PIPELINE_SEED)
 
@@ -385,7 +414,7 @@ def run_forecast_pipeline():
 
     print("\n[PHASE 1] Loading and preprocessing data...")
     df_holidays = load_holidays_data(HOLIDAY_YEARS, HOLIDAY_A_NAMES, US_HOLIDAYS_SUBSET)
-    df_historical = engineer_features_historical(HISTORICAL_DATA_FILE, df_holidays)
+    df_historical = engineer_features_historical(historical_data_file, df_holidays)
     print(f"Number of features: {N_FEATURES}. Feature order: {list(FEATURE_ORDER)}")
 
     if df_historical.isnull().values.any():
@@ -424,13 +453,13 @@ def run_forecast_pipeline():
 
     print("\n[PHASE 3] Hyperparameter search (manual TimeSeriesSplit CV)...")
     try:
-        with open(SCALER_CV_PKL, 'wb') as f:
+        with open(scaler_cv_pkl, 'wb') as f:
             pickle.dump(scaler_cv_obj, f)
-        print(f"CV scaler saved to {SCALER_CV_PKL}")
+        print(f"CV scaler saved to {scaler_cv_pkl}")
     except OSError as e:
         print(f"Warning: could not save CV scaler: {e}")
 
-    combos = list(ParameterGrid(GRID_SEARCH_PARAMS))
+    combos = list(ParameterGrid(grid_search_params))
     tscv = TimeSeriesSplit(n_splits=CV_N_SPLITS)
     print(f"Evaluating {len(combos)} combos × {CV_N_SPLITS} folds = {len(combos) * CV_N_SPLITS} total fits")
 
@@ -488,7 +517,8 @@ def run_forecast_pipeline():
 
     if X_test_cv.size and y_test_cv.size:
         print("\nEvaluating best CV model on the held-out CV test set...")
-        _evaluate_cv_model(best_cv_model, scaler_cv_obj, X_test_cv, y_test_cv, df_historical)
+        _evaluate_cv_model(best_cv_model, scaler_cv_obj, X_test_cv, y_test_cv, df_historical,
+                           cv_test_plot)
 
     # --- Phase 4: Final model on all historical data ---
     print("\n[PHASE 4] Training final model on all historical data...")
@@ -499,9 +529,9 @@ def run_forecast_pipeline():
     )
 
     try:
-        with open(SCALER_FINAL_PKL, 'wb') as f:
+        with open(scaler_final_pkl, 'wb') as f:
             pickle.dump(scaler_final_obj, f)
-        print(f"Final scaler saved to {SCALER_FINAL_PKL}")
+        print(f"Final scaler saved to {scaler_final_pkl}")
     except OSError as e:
         print(f"Warning: could not save final scaler: {e}")
 
@@ -537,8 +567,8 @@ def run_forecast_pipeline():
     print("Final model training complete.")
 
     try:
-        final_model.save(MODEL_FINAL_KERAS)
-        print(f"Final model saved to {MODEL_FINAL_KERAS}")
+        final_model.save(model_final_keras)
+        print(f"Final model saved to {model_final_keras}")
         model_for_future_prediction = final_model
         scaler_for_future_prediction = scaler_final_obj
     except OSError as e:
@@ -549,16 +579,18 @@ def run_forecast_pipeline():
     # --- Phase 5: Future prediction ---
     print("\n[PHASE 5] Generating future predictions...")
     try:
-        df_future_exog = pd.read_csv(FUTURE_ROLLCAP_FILE, parse_dates=['date'])
+        df_future_exog = pd.read_csv(future_rollcap_file, parse_dates=['date'])
     except FileNotFoundError:
         raise FileNotFoundError(
-            f"Future RollCap file not found: {FUTURE_ROLLCAP_FILE}. "
-            "Run generate_rollcap_dummy_data.py first."
+            f"Future RollCap file not found: {future_rollcap_file}. "
+            "Run data/generate_rollcap_dummy_data.py first."
         )
 
     pred_start_date = df_historical.index.max() + pd.Timedelta(days=1)
     pred_dates = pd.date_range(start=pred_start_date, periods=len(df_future_exog))
-    df_future_for_pred = _build_future_frame(df_holidays, df_historical, pred_dates)
+    df_future_for_pred = _build_future_frame(
+        df_holidays, pred_dates, future_rollcap_file, future_month_sum_file
+    )
 
     _predict_future(
         model_for_future_prediction,
@@ -566,10 +598,38 @@ def run_forecast_pipeline():
         df_historical,
         df_future_for_pred,
         pred_dates,
+        forecast_plot,
+        forecast_csv,
     )
 
     print("\n--- Forecasting Pipeline Finished ---")
 
 
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Train the Conv1D + LSTM model and write a 12-month daily forecast.",
+    )
+    parser.add_argument(
+        '--data-dir', default=DEFAULT_DATA_DIR,
+        help="Directory holding the three input CSVs written by data/generate_*.py "
+             "(default: %(default)s).",
+    )
+    parser.add_argument(
+        '--output-dir', default=DEFAULT_OUTPUT_DIR,
+        help="Where to write the model, scalers, plots and forecast CSV (default: %(default)s).",
+    )
+    parser.add_argument(
+        '--epochs', type=int, default=None,
+        help="Override the training epochs in GRID_SEARCH_PARAMS "
+             f"(default: {GRID_SEARCH_PARAMS['epochs'][0]}). Use a small value for a quick check.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    run_forecast_pipeline(data_dir=args.data_dir, output_dir=args.output_dir, epochs=args.epochs)
+
+
 if __name__ == '__main__':
-    run_forecast_pipeline()
+    main()

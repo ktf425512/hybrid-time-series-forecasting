@@ -1,169 +1,137 @@
 # Conv1D + LSTM Call Volume Forecasting
 
-> 📌 This project was developed end-to-end by **Xichun Han** as a demonstration of time series forecasting with hybrid deep learning.  
-> It is shared under the MIT License for educational purposes. If reused, **proper attribution is expected**.
+Daily inbound call volume for a sales center, forecast 12 months ahead with a
+hybrid Conv1D + LSTM network in TensorFlow/Keras. The problem is framed as
+**disaggregation**: planning supplies a monthly call total, and the model learns
+how that total spreads across the days of the month from weekday, holiday,
+capacity and recent-history signals. Conv1D layers pick up short local shapes
+in the 7-day input window (the weekday cycle, holiday dips); the stacked LSTMs
+carry the longer context the convolutions cannot. The original version ran on
+real call-center data at a luxury travel company; this public version runs on
+synthetic data only so the whole pipeline is reproducible from a clean checkout.
 
----
-
-## Overview
-
-This project builds a deep learning pipeline to forecast daily inbound call volumes using a hybrid Conv1D + LSTM architecture. The code is structured for reproducibility using fully simulated data and mimics real-world capacity trends, holiday effects, and seasonal fluctuations.
-
-Originally built to support staffing optimization at luxury travel company, this forecasting system reduced error by ~30% compared to Excel-based manual trendlines.
-
----
-
-## Highlights
-
-- **Problem framing**: *disaggregation* — given an externally-forecast monthly total, learn the daily distribution within it (see "Design Notes" below)
-- **Model**: Conv1D layers for pattern extraction + LSTM layers for sequential memory
-- **Features**: Simulated business metrics (`RollCap`, `monthly_sum`), U.S. holidays, and calendar signals
-- **Optimization**: Hyperparameter tuning with `GridSearchCV` + `TimeSeriesSplit` (no shuffling on time-ordered data)
-- **Reproducibility**: all RNGs seeded (`tf.keras.utils.set_random_seed`, NumPy, simulator)
-- **Stack**: TensorFlow/Keras, scikit-learn, pandas, holidays
-
----
-
-## Repository Structure
-
-```
-├── _sim_config.py                  # shared constants + helpers for the 3 generators
-├── generate_dummy_data.py          # historical daily data
-├── generate_monthly_sum_data.py    # future monthly totals (simulated external forecast)
-├── generate_rollcap_dummy_data.py  # future RollCap exogenous series
-├── LSTM_CONV1D_Model.py            # training + forecasting entry point
-├── LSTM_CONV1D_Forecast.ipynb      # exploratory twin; the .py is authoritative
-├── requirements.txt
-└── README.md
-```
-
----
-
-## Features
-
-| Feature        | Description                                              |
-|----------------|----------------------------------------------------------|
-| `Total_Presented` | Target variable – daily inbound calls                 |
-| `RollCap`      | 30-day rolling sum of projected capacity                 |
-| `monthly_sum`  | Externally-forecast monthly total (noisy at inference)   |
-| `Holiday_A`    | Full-company closure (e.g., Christmas)                   |
-| `Holiday_B`    | Reduced operation holidays (e.g., Labor Day)             |
-| `weekday`, `week_number`, `month` | Calendar-based seasonality             |
-
----
-
-## Model Architecture
-
-- **Input**: `(7, 8)` sliding window of features
-- **Conv1D Layers**: 64 & 32 filters (kernels 5 & 3), ReLU
-- **LSTM Layers**: 3 stacked LSTMs with dropout & L2 regularization
-- **Dense Layers**: 32-unit hidden layer + 1-unit output
-- **Optimization**: Adam / Nadam, learning rate grid, batch size grid
-- **Loss Function**: Mean Squared Error (MSE)
-- **EarlyStopping**: Stops when training loss stagnates
-
----
-
-## How to Run
-
-```bash
-# Step 1: Generate synthetic training + future data
-python generate_dummy_data.py
-python generate_monthly_sum_data.py
-python generate_rollcap_dummy_data.py
-
-# Step 2: Train and forecast
-python LSTM_CONV1D_Model.py
-```
-
-Model outputs:
-- Scaled and original-scale MAE/MSE
-- Forecast plot vs historical
-- Future prediction CSV (optional)
-
----
-
-## Design Notes
-
-**Why `monthly_sum` is a feature, not a leak.** In the original business
-context this model solved, the month-level total is supplied externally by
-the finance/planning team, and the NN's job is to distribute it across the
-days of the month using learned weekday / holiday / trend patterns. That
-makes it a *disaggregation* (or top-down reconciliation) problem — the
-monthly aggregate is an input at inference, not a forbidden aggregate of the
-target.
-
-**Noise injection on `monthly_sum` (training-time).** On historical data,
-`monthly_sum` is the *exact* sum of the target that month — noise-free. A
-model trained on that signal over-relies on it and breaks when deployed
-against real external monthly forecasts (which typically drift 5–10%). To
-close the train/inference distribution gap,
-[`inject_monthly_sum_noise`](LSTM_CONV1D_Model.py) multiplies each month's
-value by a per-month jitter factor ~ N(1, 0.05) (one factor per month,
-shared across all days in that month, seed-locked for reproducibility).
-At inference, `future_Month_Sum.csv` is itself the "noisy external
-forecast" role, so no extra perturbation is applied.
-
----
+Author: **Xichun (Harrison) Han** ([LinkedIn](https://www.linkedin.com/in/xichun-han)). MIT License.
 
 ## Results
 
-*Reported numbers are from `pipeline_output_new.log` after the refactor.
-Noise injection intentionally raises MAE vs. the pre-refactor 0.0485 — the
-new number honestly reflects the disaggregation task under realistic
-monthly-forecast drift.*
+Reference numbers are from the author's run of `python LSTM_CONV1D_Model.py`
+on the default synthetic data (Windows, CPU, TensorFlow 2.16.1), which produced
+the plots below. The second column is an independent rerun on Linux (Python
+3.12, CPU) from a clean checkout; it takes about three minutes. The target is
+min-max scaled to [0, 1] for training; "original scale" is calls per day on a
+base of roughly 80,000 to 100,000.
 
-| Metric                        | Value    | Note                                      |
-|-------------------------------|----------|-------------------------------------------|
-| Scaled Test MAE (MinMax)      | 0.0856   | up from 0.0485 pre-noise (honest baseline)|
-| Original-scale Test MAE       | ~2,276 / day | ≈ 2.5% relative error on ~90k/day base |
-| Original-scale Test RMSE      | ~2,968 / day |                                        |
+| Metric (held-out last 5% of history, 48 days)   | Reference | Linux rerun |
+|--------------------------------------------------|-----------|-------------|
+| Scaled test MAE                                  | 0.0856    | 0.0860      |
+| Original-scale test MAE (calls/day)              | 2,276     | 2,286       |
+| Original-scale test RMSE (calls/day)             | 2,968     | 2,961       |
+| CV mean MSE, scaled (TimeSeriesSplit, 3 folds)   | 0.01537   | 0.01525     |
 
-CV mean MSE (scaled, TimeSeriesSplit n_splits=3): **0.01537**.
+An MAE near 2,300 calls/day on a 90,000/day base is about 2.5% relative error.
 
-### Caveat on hyperparameter search
+![CV test set: actual vs predicted](assets/cv_test_actual_vs_predicted.png)
 
-This repo's CV loop is currently configured with a single combo
-(`batch_size=16, epochs=30, adam, lr=0.001, l2=0.01`) because repeated
-`model.fit()` calls in one Python process trigger a native-layer crash on
-this Windows + TF 2.16 stack after ~2-3 fits (no Python traceback; process
-exits with code 127/139). The multi-dimensional grid is kept in
-`GRID_SEARCH_PARAMS` — to explore it, either expand the grid and run on a
-fresh TF / Linux environment, or run the pipeline multiple times with
-different hardcoded combos.
+*Held-out test window. The model tracks the weekly cycle and holiday dips but
+under-shoots the sharpest peaks.*
 
----
+![12-month forecast joined to history](assets/forecast_vs_historical.png)
 
-## Business Context
+*Iterative one-step-ahead forecast for 2025 appended to the last 60 days of
+history. The weekly pattern and the mid-year seasonal dip are both visible.*
 
-In real deployments, this architecture helped predict call demand across a 12-month horizon, accounting for cruise seasonality, promotional spikes, and U.S. holiday effects. It enabled more efficient scheduling, cost reduction, and faster decision-making in both sales and service departments.
+## How to reproduce
 
----
+Requires Python 3.12 (`.python-version`). Everything runs on CPU in a few minutes.
 
-## Author
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 
-**Xichun (Harrison) Han**  
-[LinkedIn](https://www.linkedin.com/in/xichun-han)
+# 1. Generate synthetic data (writes three CSVs into data/)
+python data/generate_dummy_data.py            # 3 years of daily history
+python data/generate_monthly_sum_data.py      # 12 future monthly totals
+python data/generate_rollcap_dummy_data.py    # 12 months of future RollCap
 
----
+# 2. Train, evaluate and forecast (writes to outputs/)
+python LSTM_CONV1D_Model.py
 
-## 📈 Forecast Visualization
+# Quick check instead of the full 30-epoch run
+python LSTM_CONV1D_Model.py --epochs 2
 
-Below is a sample forecast from the Conv1D + LSTM model using simulated data.
+# Smoke test: tiny dataset, one epoch, under a minute on CPU
+python -m pytest tests/
+```
 
-![Forecast Result](forecast_cover_clean_final.png)
+`python LSTM_CONV1D_Model.py --help` lists the flags (`--data-dir`,
+`--output-dir`, `--epochs`). Outputs land in `outputs/`: `model_final.keras`,
+`scaler_cv.pkl`, `scaler_final.pkl`, the two plots above and `forecast.csv`
+with one row per forecast day.
 
-*Cover image: pre-refactor forecast (for visual demonstration).*
+## Project structure
 
-Current pipeline outputs:
+```
+├── LSTM_CONV1D_Model.py           # the pipeline: features -> CV -> final fit -> 12-month forecast
+├── LSTM_CONV1D_Forecast.ipynb     # exploratory notebook (see note below)
+├── data/
+│   ├── _sim_config.py             # simulation constants shared by the three generators
+│   ├── generate_dummy_data.py     # historical daily calls, capacity and RollCap
+│   ├── generate_monthly_sum_data.py   # future monthly totals (stand-in for the planning forecast)
+│   └── generate_rollcap_dummy_data.py # future RollCap series
+├── tests/test_smoke.py            # end-to-end run on a tiny dataset
+├── assets/                        # result plots embedded above
+├── requirements.txt               # pinned runtime dependencies
+├── requirements-notebook.txt      # extras for the notebook only
+├── .python-version                # 3.12
+└── LICENSE                        # MIT
+```
 
-- `cv_test_actual_vs_predicted.png` — CV test-fold predictions overlaid on actuals
-- `forecast_vs_historical.png` — 12-month forward forecast joined to the last 60 days of history
+`LSTM_CONV1D_Model.py` is the canonical pipeline. The notebook is the earlier
+exploratory version and has drifted from it: it runs a 16-combination grid
+search through scikeras, uses wider LSTM layers, and does not apply the
+training-time noise injection described below. Read it for the exploration
+(correlation heatmap, random-forest feature importances); run the script for
+the results.
 
----
+## Design decisions
 
-## License
+**Features.** Eight inputs per day: the target itself, `RollCap` (30-day rolling
+sum of staffed capacity), two holiday flags from the `holidays` package
+(`Holiday_A` for full closures such as Christmas, `Holiday_B` for reduced-hours
+holidays), weekday, ISO week number, month, and `monthly_sum`. The three
+continuous columns are min-max scaled with a scaler fit on the training split
+only; calendar flags are fed as integers.
 
-MIT License. See `LICENSE` file for details.  
-Use allowed for educational purposes. **Attribution is required for reuse.**
+**Monthly total as an input, not a leak.** `monthly_sum` is the month's call
+total. In production it is supplied by planning before the month starts, so at
+inference it is a legitimate input, and the model's job is the daily breakdown.
 
+**Training-time noise on `monthly_sum`.** On historical data the monthly total
+is exact, which lets the model lean on it harder than it can in production,
+where the planning forecast is typically 5 to 10% off. Before training, each
+month's value is multiplied by one factor drawn from N(1, 0.05), shared across
+all days of that month and seeded for reproducibility. The future monthly totals
+are already an external forecast, so they are not perturbed. This costs some
+test accuracy on synthetic data and is kept deliberately.
+
+**Validation.** Chronological 95/5 split, `TimeSeriesSplit` cross-validation on
+the training part, early stopping on a trailing 10% validation slice for the
+final fit. Nothing is shuffled. All random sources are seeded.
+
+**Forecasting.** The 12-month horizon is produced one day at a time; each
+prediction is written back into the input window for the next step, while
+`RollCap`, holidays and `monthly_sum` come from the future CSVs.
+
+## Limitations
+
+- All data is synthetic (sinusoidal seasonality, weekday factors, Gaussian
+  noise). The error figures above say the pipeline works, not how it performs
+  on real traffic.
+- The hyperparameter grid is reduced to one combination. Repeated `model.fit`
+  calls in one process crashed on the author's Windows + TensorFlow 2.16 setup,
+  so the wider search lives only in the notebook.
+- There is no baseline comparison (seasonal naive, linear model) in this repo.
+- The iterative forecast feeds its own predictions back in, so errors can
+  compound over the 365-day horizon; this is not quantified here.
+- The notebook is kept as-is with its outputs and is not maintained alongside
+  the script.
